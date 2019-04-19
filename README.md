@@ -8,7 +8,7 @@ The library uses Dart mqtt_client library so you have to add it to your dependen
 dependencies:
   flutter:
     sdk: flutter
-  mqtt_client: ^5.5.2 
+  mqtt_client: ^5.5.2   
 `
 
 You can find sample usage in the "emitter_sample_usage.dart" file.
