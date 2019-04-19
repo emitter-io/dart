@@ -1,3 +1,5 @@
+# Emitter Dart library for Flutter
+
 This repo contains an Emitter Dart library that can be used in Flutter.
 
 To use it simply add emitter.dart file into your project.
