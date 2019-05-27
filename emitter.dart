@@ -1,38 +1,57 @@
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:typed_data/typed_data.dart';
 import 'dart:convert';
+import 'dart:async';
 
 typedef EmitterCallback = void Function(Emitter emitter);
 typedef EmitterSubscribeCallback = void Function(String topic);
-typedef EmitterKeygenCallback = void Function(dynamic object);
 typedef EmitterPresenceCallback = void Function(dynamic object);
-typedef EmitterMeCallback = void Function(dynamic object);
 typedef EmitterMessageCallback = void Function(EmitterMessage message);
 
 class Emitter {
   MqttClient _mqtt;
+  String _rpcChannel = "";
+  String _rpcKey = "";
+  String _myId = "";
+  int _rpcId = 0;
 
-  EmitterCallback onConnect;
-  EmitterCallback onDisconnect;
-  EmitterSubscribeCallback onSubscribed;
-  EmitterSubscribeCallback onUnsubscribed;
-  EmitterSubscribeCallback onSubscribeFail;
-  EmitterKeygenCallback onKeygen;
-  EmitterPresenceCallback onPresence;
-  EmitterMeCallback onMe;
-  EmitterMessageCallback onMessage;
+  var _onConnectHandlers = <EmitterCallback>[];
+  void onConnect(EmitterCallback handler) => _onConnectHandlers.add(handler);
+  var _onDisconnectHandlers = <EmitterCallback>[];
+  void onDisconnect(EmitterCallback handler) =>
+      _onDisconnectHandlers.add(handler);
+  var _onSubscribedHandlers = <EmitterSubscribeCallback>[];
+  void onSubscribed(EmitterSubscribeCallback handler) =>
+      _onSubscribedHandlers.add(handler);
+  var _onUnsubscribedHandlers = <EmitterSubscribeCallback>[];
+  void onUnsubscribed(EmitterSubscribeCallback handler) =>
+      _onUnsubscribedHandlers.add(handler);
+  var _onSubscribeFailHandlers = <EmitterSubscribeCallback>[];
+  void onSubscribeFail(EmitterSubscribeCallback handler) =>
+      _onSubscribeFailHandlers.add(handler);
+  var _onPresenceHandlers = <EmitterPresenceCallback>[];
+  void onPresence(EmitterPresenceCallback handler) =>
+      _onPresenceHandlers.add(handler);
+  var _onMessageHandlers = <EmitterMessageCallback>[];
+  void onMessage(EmitterMessageCallback handler) =>
+      _onMessageHandlers.add(handler);
 
-  Future<bool> connect({
-    bool secure = false,
-    String host = "api.emitter.io",
-    int port = 8080,
-    int keepalive = 60,
-    bool logging = false,
-  }) async {
-    String brokerUrl = (secure ? "wss://" : "ws://") + host;
+  Map<int, Completer> _completers = new Map<int, Completer>();
+  Map<int, Completer> _rpcCompleters = new Map<int, Completer>();
+
+  Future<bool> connect(
+      {bool secure = false,
+      String host = "api.emitter.io",
+      int port = 8080,
+      int keepalive = 60,
+      bool logging = false,
+      bool useWebSocket = false}) async {
+    String brokerUrl =
+        useWebSocket ? (secure ? "wss://" : "ws://") + host : host;
     _mqtt = new MqttClient(brokerUrl, "");
     _mqtt.port = port;
-    _mqtt.useWebSocket = true;
+    _mqtt.secure = useWebSocket ? false : secure;
+    _mqtt.useWebSocket = useWebSocket;
     _mqtt.useAlternateWebSocketImplementation = false;
     _mqtt.logging(on: logging);
     _mqtt.keepAlivePeriod = keepalive;
@@ -68,62 +87,52 @@ class Emitter {
     }
 
     _mqtt.updates.listen(_onMessage);
-
+    var me = await getMe();
+    _myId = me["id"];
     return true;
   }
 
   /*
   * Publishes a message to the currently opened endpoint.
   */
-  publish(String key, String channel, String message,
-      {bool me = true, int ttl = 0}) {
+  int publish(String key, String channel, String message,
+      {bool me = true,
+      int ttl = 0,
+      MqttQos qos = MqttQos.atLeastOnce,
+      bool retain = false}) {
     var options = new Map<String, String>();
-    // The default server's behavior when 'me' is absent, is to send the publisher its own messages.
-    // To avoid any ambiguity, this parameter is always set here.
-    if (me) {
-      options["me"] = "1";
-    } else {
-      options["me"] = "0";
-    }
-    options["ttl"] = ttl.toString();
+    if (!me) options["me"] = "0";
+    if (ttl > 0) options["ttl"] = ttl.toString();
     var topic = _formatChannel(key, channel, options);
-    _mqtt.publishMessage(topic, MqttQos.atLeastOnce, _payload(message));
-    return this;
+    return _mqtt.publishMessage(topic, qos, _payload(message), retain: retain);
   }
 
   /*
   * Publishes a message through a link.
   */
-  publishWithLink(String link, String message) {
-    _mqtt.publishMessage(link, MqttQos.atLeastOnce, _payload(message));
+  int publishWithLink(String link, String message) {
+    return _mqtt.publishMessage(link, MqttQos.atLeastOnce, _payload(message));
   }
 
   /*
   * Subscribes to a particular channel.
   */
-  subscribe(String key, String channel, {int last = 0}) {
+  Subscription subscribe(String key, String channel, {int last = 0}) {
     var options = new Map<String, String>();
     if (last > 0) options["last"] = last.toString();
     var topic = _formatChannel(key, channel, options);
-    _mqtt.subscribe(topic, MqttQos.atLeastOnce);
-    return this;
+    return _mqtt.subscribe(topic, MqttQos.atLeastOnce);
   }
 
   /*
   * Create a link to a particular channel.
   */
-  link(String key, String channel, String name, bool private, bool subscribe,
-      {bool me = true, int ttl = 0}) {
+  Future<dynamic> link(
+      String key, String channel, String name, bool private, bool subscribe,
+      {bool me = true, int ttl = 0, int timeout = 5000}) async {
     var options = new Map<String, String>();
-    // The default server's behavior when 'me' is absent, is to send the publisher its own messages.
-    // To avoid any ambiguity, this parameter is always set here.
-    if (me) {
-      options["me"] = "1";
-    } else {
-      options["me"] = "0";
-    }
-    options["ttl"] = ttl.toString();
-
+    if (!me) options["me"] = "0";
+    if (ttl > 0) options["ttl"] = ttl.toString();
     String formattedChannel = _formatChannel(null, channel, options);
     var request = {
       "key": key,
@@ -132,56 +141,93 @@ class Emitter {
       "private": private,
       "subscribe": subscribe
     };
-    _mqtt.publishMessage(
-        "emitter/link/", MqttQos.atLeastOnce, _payload(jsonEncode(request)));
-    return this;
+    var response = await _executeAsync("emitter/link/", jsonEncode(request),
+        timeout: timeout);
+    return response;
   }
 
   /*
   * Unsubscribes from a particular channel.
   */
-  unsubscribe(String key, String channel) {
+  void unsubscribe(String key, String channel) {
     var topic = _formatChannel(key, channel, null);
     _mqtt.unsubscribe(topic);
-    return this;
   }
 
   /*
   * Sends a key generation request to the server.
-  * type is the type of the key to generate. Possible options include r for read-only, w for write-only, 
-  * p for presence only and rw for read-write keys 
-  * (In addition to rw, you can use any combination of r, w and p for key generation)
+  * type is the type of the key to generate. 
+  * r = Read, w = Write, s = Store, l = Load, p = Presence, e = Extending for private sub-channels
+  * You can use any combination like "rw", "rwe" etc.
   * ttl is the time-to-live of the key, in seconds.
   */
-  keygen(String key, String channel, String type, int ttl) {
+  Future<String> keygen(String key, String channel, String type, int ttl,
+      {int timeout = 5000}) async {
     var request = {"key": key, "channel": channel, "type": type, "ttl": ttl};
-    _mqtt.publishMessage(
-        "emitter/keygen/", MqttQos.atLeastOnce, _payload(jsonEncode(request)));
-    return this;
+    var response = await _executeAsync("emitter/keygen/", jsonEncode(request),
+        timeout: timeout);
+    if (response != null) {
+      return response["key"];
+    }
+    return "";
   }
 
   /*
-  * Sends a presence request to the server.
-  * status: Whether a full status should be sent back in the response.
-  * changes: Whether we should subscribe this client to presence notification events.
+  * Subcribes to presence of a channel
   */
-  presence(String key, String channel, bool status, bool changes) {
+  int subscribePresence(String key, String channel) {
     var request = {
       "key": key,
       "channel": channel,
-      "status": status,
-      "changes": changes
+      "status": false,
+      "changes": true
     };
-    _mqtt.publishMessage("emitter/presence/", MqttQos.atLeastOnce,
+    return _mqtt.publishMessage("emitter/presence/", MqttQos.atLeastOnce,
         _payload(jsonEncode(request)));
-    return this;
+  }
+
+  /*
+  * Gets the presence of a channel
+  */
+  Future<dynamic> getPresence(String key, String channel,
+      {int timeout = 5000}) async {
+    var request = {
+      "key": key,
+      "channel": channel,
+      "status": true,
+      "changes": false
+    };
+    var response = await _executeAsync("emitter/presence/", jsonEncode(request),
+        timeout: timeout);
+    return response;
   }
 
   /*
   * Request information about the connection to the server.
   */
-  me() {
-    _mqtt.publishMessage("emitter/me/", MqttQos.atLeastOnce, _payload(""));
+  Future<dynamic> getMe({int timeout = 5000}) async {
+    var response = await _executeAsync("emitter/me/", "", timeout: timeout);
+    return response;
+  }
+
+  initRPC(String channel, String key) {
+    if (!channel.endsWith("/")) channel += "/";
+    _rpcChannel = channel;
+    _rpcKey = key;
+    subscribe(_rpcKey, _rpcChannel);
+  }
+
+  Future<dynamic> rpc(dynamic payload, {int timeout = 5000}) {
+    var id = ++_rpcId;
+    Completer c = new Completer<dynamic>();
+    _rpcCompleters[id] = c;
+    var channel = _rpcChannel + _myId + "/" + id.toString();
+    publish(_rpcKey, channel, jsonEncode(payload), me: false);
+    new Timer(new Duration(milliseconds: timeout), () {
+      _rpcCompleters.remove(id);
+      if (!c.isCompleted) c.completeError("rpc timeout");
+    });
+    return c.future;
   }
 
   _formatChannel(String key, String channel, Map<String, String> options) {
@@ -194,7 +240,9 @@ class Emitter {
     // Add options
     if (options != null && options.length > 0) {
       formatted += "?";
-      options.forEach((key, value) => {formatted += key + "=" + value + "&"});
+      options.forEach((key, value) {
+        formatted += key + "=" + value + "&";
+      });
     }
     if (formatted.endsWith("&"))
       formatted = formatted.substring(0, formatted.length - 1);
@@ -208,33 +256,76 @@ class Emitter {
     return builder.payload;
   }
 
+  Future<dynamic> _executeAsync(String request, String payload,
+      {int timeout = 5000}) {
+    Completer c = new Completer<dynamic>();
+    int id =
+        _mqtt.publishMessage(request, MqttQos.atLeastOnce, _payload(payload));
+    _completers[id] = c;
+    new Timer(new Duration(milliseconds: timeout), () {
+      _completers.remove(id);
+      if (!c.isCompleted) c.completeError("$request timeout");
+    });
+    return c.future;
+  }
+
   _onDisconnected() {
     print('EMITTER::Disconnected');
-    if (onDisconnect != null) onDisconnect(this);
+    _onDisconnectHandlers.forEach((h) => h(this));
+    //if (onDisconnect != null) onDisconnect(this);
   }
 
   _onConnected() {
     print('EMITTER::Connected');
-    if (onConnect != null) onConnect(this);
+    _onConnectHandlers.forEach((h) => h(this));
+    //if (onConnect != null) onConnect(this);
   }
 
   _onSubscribed(String topic) {
     print('EMITTER::Subscription confirmed for topic $topic');
-    if (onSubscribed != null) onSubscribed(topic);
+    _onSubscribedHandlers.forEach((h) => h(topic));
+    //if (onSubscribed != null) onSubscribed(topic);
   }
 
   _onUnsubscribed(String topic) {
     print('EMITTER::Unsubscription confirmed for topic $topic');
-    if (onUnsubscribed != null) onUnsubscribed(topic);
+    _onUnsubscribedHandlers.forEach((h) => h(topic));
+    //if (onUnsubscribed != null) onUnsubscribed(topic);
   }
 
   _onSubscribeFail(String topic) {
     print('EMITTER::Subscription failed for topic $topic');
-    if (onSubscribeFail != null) onSubscribeFail(topic);
+    _onSubscribeFailHandlers.forEach((h) => h(topic));
+    //if (onSubscribeFail != null) onSubscribeFail(topic);
   }
 
   _pong() {
     print('EMITTER::Pong');
+  }
+
+  bool _checkRPCResult(EmitterMessage message) {
+    var channel = message.channel.substring(0, message.channel.length - 1);
+    var id = int.parse(channel.substring(channel.lastIndexOf("/") + 1));
+    Completer c = _rpcCompleters[id];
+    if (c != null) {
+      _rpcCompleters.remove(id);
+      c.complete(message.asObject());
+      return true;
+    }
+    return false;
+  }
+
+  bool _checkRequestResult(EmitterMessage message) {
+    var obj = message.asObject();
+    if (obj["req"] != null) {
+      Completer c = _completers[obj["req"]];
+      if (c != null) {
+        _completers.remove(obj["req"]);
+        c.complete(obj);
+        return true;
+      }
+    }
+    return false;
   }
 
   _onMessage(List<MqttReceivedMessage<MqttMessage>> c) {
@@ -242,14 +333,20 @@ class Emitter {
     final String topic = c[0].topic;
     var message = new EmitterMessage(topic, msg.payload.message);
     print('EMITTER::$topic -> ${message.asString()}');
-    if (topic.startsWith("emitter/keygen")) {
-      if (onKeygen != null) onKeygen(message.asObject());
-    } else if (topic.startsWith("emitter/presence")) {
-      if (onPresence != null) onPresence(message.asObject());
-    } else if (topic.startsWith("emitter/me")) {
-      if (onMe != null) onMe(message.asObject());
+    if (topic.startsWith("emitter/presence")) {
+      if (!_checkRequestResult(message))
+        _onPresenceHandlers.forEach((h) => h(message.asObject()));
+    } else if (topic.startsWith("emitter/keygen") ||
+        topic.startsWith("emitter/link") ||
+        topic.startsWith("emitter/me")) {
+      _checkRequestResult(message);
     } else {
-      if (onMessage != null) onMessage(message);
+      bool callMessageHandler = true;
+      if (_rpcChannel != "" && topic.startsWith(_rpcChannel)) {
+        callMessageHandler = !_checkRPCResult(message);
+      }
+      if (callMessageHandler)
+        _onMessageHandlers.forEach((h) => h(message));
     }
   }
 }
@@ -257,6 +354,8 @@ class Emitter {
 class EmitterMessage {
   String channel;
   Uint8Buffer binary;
+  String _string;
+  dynamic _object;
 
   EmitterMessage(String topic, Uint8Buffer payload) {
     channel = topic;
@@ -264,15 +363,18 @@ class EmitterMessage {
   }
 
   String asString() {
-    return MqttPublishPayload.bytesToStringAsString(binary);
+    if (_string == null) {
+      _string = MqttPublishPayload.bytesToStringAsString(binary);
+    }
+    return _string;
   }
 
   dynamic asObject() {
-    dynamic object; 
-    try {
-      object = jsonDecode(asString());
-    } catch (err) {}
-    return object;
+    if (_object == null) {
+      try {
+        _object = jsonDecode(asString());
+      } catch (err) {}
+    }
+    return _object;
   }
-
 }

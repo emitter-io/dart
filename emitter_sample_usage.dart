@@ -1,25 +1,25 @@
-String key = "8JomQ2vFhHoU_DfGdBKfZvChXXUECdHG";
 String secretKey = "J31n6RIj3bgV2uUihswQ5CsjbJJ98yU2";
-_emitter = new Emitter();
-_emitter.onMessage = (EmitterMessage message) {
+Emitter _emitter = new Emitter();
+_emitter.onMessage((EmitterMessage message) {
   print("New message: ${message.channel} -> ${message.asString()}");
-};
-_emitter.onKeygen = (obj) {
-  print("New key: ${obj["key"]} for channel ${obj["channel"]}");
-};
-_emitter.onPresence = (obj) {
-  if (obj["event"] == "subscribe") {
-    print("${obj["who"]["id"]} subscribed to channel ${obj["channel"]}");
-  }      
-  if (obj["event"] == "unsubscribe") {
-    print("${obj["who"]["id"]} unsubscribed from channel ${obj["channel"]}");
-  }      
-};
-await _emitter.connect();
-print("CONNECTED");
-_emitter.me();
-_emitter.subscribe(key, "mychannel");
-_emitter.publish(key, "mychannel", "Hello from Flutter Emitter");
-_emitter.keygen(secretKey, "mychannel/hello/", "rw", 0);
-_emitter.presence(key, "mychannel/hello", true, true);
-_emitter.subscribe(key, "mychannel/hello");
+});
+_emitter.onPresence((obj) {
+  print("OnPresence:");
+  print(obj);
+});
+await _emitter.connect(host: "my.server.com", port: 8080, secure: false);
+String _key = await _emitter.keygen(secretKey, "mychannel/#/", "rwslpe", 0);
+print("Key generated:" + _key);
+print("Subscribing to mychannel/hello presence");
+_emitter.subscribePresence(_key, "mychannel/");
+print("Subscribing to mychannel/hello");
+_emitter.subscribe(_key, "mychannel/hello");
+print("Publishing message to mychannel");
+_emitter.publish(_key, "mychannel/hello", "Hello from Flutter Emitter");
+var pr = await _emitter.getPresence(_key, "mychannel/hello");
+print(pr);
+var me = await _emitter.getMe();
+print(me);
+var linkResult = await _emitter.link(_key, "mychannel/privatelink/", "rq", true, true);
+print(linkResult);
+_emitter.publishWithLink("rq", "Hello");
