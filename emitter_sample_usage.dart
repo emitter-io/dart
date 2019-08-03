@@ -13,7 +13,9 @@ print("Key generated:" + _key);
 print("Subscribing to mychannel/hello presence");
 _emitter.subscribePresence(_key, "mychannel/");
 print("Subscribing to mychannel/hello");
-_emitter.subscribe(_key, "mychannel/hello");
+_emitter.subscribe(_key, "mychannel/hello", handler: (message) {
+  print("Inline message handler:" + message.channel + " => " + message.asString());
+});
 print("Publishing message to mychannel");
 _emitter.publish(_key, "mychannel/hello", "Hello from Flutter Emitter");
 var pr = await _emitter.getPresence(_key, "mychannel/hello");

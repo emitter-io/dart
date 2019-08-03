@@ -14,6 +14,8 @@ class Emitter {
   String _rpcKey = "";
   String _myId = "";
   int _rpcId = 0;
+  ReverseTrie _trie = new ReverseTrie(level: -1);
+  bool _logging = false;
 
   var _onConnectHandlers = <EmitterCallback>[];
   void onConnect(EmitterCallback handler) => _onConnectHandlers.add(handler);
@@ -61,6 +63,7 @@ class Emitter {
     _mqtt.onUnsubscribed = _onUnsubscribed;
     _mqtt.onSubscribeFail = _onSubscribeFail;
     _mqtt.pongCallback = _pong;
+    _logging = logging;
 
     final MqttConnectMessage connMess = MqttConnectMessage()
         .keepAliveFor(keepalive)
@@ -71,16 +74,16 @@ class Emitter {
     try {
       await _mqtt.connect();
     } on Exception catch (e) {
-      print('EMITTER::client exception - $e');
+      _log('EMITTER::client exception - $e');
       _mqtt.disconnect();
       return false;
     }
 
     /// Check we are connected
     if (_mqtt.connectionStatus.state == MqttConnectionState.connected) {
-      print('EMITTER::Mosquitto client connected');
+      _log('EMITTER::Mosquitto client connected');
     } else {
-      print(
+      _log(
           'EMITTER::ERROR Mosquitto client connection failed - disconnecting, state is ${_mqtt.connectionStatus.state}');
       _mqtt.disconnect();
       return false;
@@ -117,7 +120,10 @@ class Emitter {
   /*
   * Subscribes to a particular channel.
   */
-  Subscription subscribe(String key, String channel, {int last = 0}) {
+  Subscription subscribe(String key, String channel, {int last = 0, EmitterMessageCallback handler}) {
+    if (handler != null)
+      this._trie.registerHandler(channel, handler);
+
     var options = new Map<String, String>();
     if (last > 0) options["last"] = last.toString();
     var topic = _formatChannel(key, channel, options);
@@ -150,6 +156,8 @@ class Emitter {
   * Unsubscribes from a particular channel.
   */
   void unsubscribe(String key, String channel) {
+    this._trie.unRegisterHandler(channel);
+
     var topic = _formatChannel(key, channel, null);
     _mqtt.unsubscribe(topic);
   }
@@ -270,37 +278,41 @@ class Emitter {
   }
 
   _onDisconnected() {
-    print('EMITTER::Disconnected');
+    _log('EMITTER::Disconnected');
     _onDisconnectHandlers.forEach((h) => h(this));
     //if (onDisconnect != null) onDisconnect(this);
   }
 
   _onConnected() {
-    print('EMITTER::Connected');
+    _log('EMITTER::Connected');
     _onConnectHandlers.forEach((h) => h(this));
     //if (onConnect != null) onConnect(this);
   }
 
   _onSubscribed(String topic) {
-    print('EMITTER::Subscription confirmed for topic $topic');
+    _log('EMITTER::Subscription confirmed for topic $topic');
     _onSubscribedHandlers.forEach((h) => h(topic));
     //if (onSubscribed != null) onSubscribed(topic);
   }
 
   _onUnsubscribed(String topic) {
-    print('EMITTER::Unsubscription confirmed for topic $topic');
+    _log('EMITTER::Unsubscription confirmed for topic $topic');
     _onUnsubscribedHandlers.forEach((h) => h(topic));
     //if (onUnsubscribed != null) onUnsubscribed(topic);
   }
 
   _onSubscribeFail(String topic) {
-    print('EMITTER::Subscription failed for topic $topic');
+    _log('EMITTER::Subscription failed for topic $topic');
     _onSubscribeFailHandlers.forEach((h) => h(topic));
     //if (onSubscribeFail != null) onSubscribeFail(topic);
   }
 
   _pong() {
-    print('EMITTER::Pong');
+    _log('EMITTER::Pong');
+  }
+
+  _log(Object message) {
+    if (_logging) print(message);
   }
 
   bool _checkRPCResult(EmitterMessage message) {
@@ -332,7 +344,7 @@ class Emitter {
     final MqttPublishMessage msg = c[0].payload;
     final String topic = c[0].topic;
     var message = new EmitterMessage(topic, msg.payload.message);
-    print('EMITTER::$topic -> ${message.asString()}');
+    _log('EMITTER::$topic -> ${message.asString()}');
     if (topic.startsWith("emitter/presence")) {
       if (!_checkRequestResult(message))
         _onPresenceHandlers.forEach((h) => h(message.asObject()));
@@ -345,8 +357,10 @@ class Emitter {
       if (_rpcChannel != "" && topic.startsWith(_rpcChannel)) {
         callMessageHandler = !_checkRPCResult(message);
       }
-      if (callMessageHandler)
+      if (callMessageHandler) {
         _onMessageHandlers.forEach((h) => h(message));
+        this._trie.match(message.channel).forEach((h) => h(message));
+      }
     }
   }
 }
@@ -377,4 +391,89 @@ class EmitterMessage {
     }
     return _object;
   }
+}
+
+class ReverseTrie {
+  Map<String, ReverseTrie> children;
+  int level;
+  EmitterMessageCallback value;
+
+  ReverseTrie({int level = 0}) {
+    this.children = new Map<String, ReverseTrie>();
+    this.level = level;
+    this.value = null;
+  }
+
+  registerHandler(String channel, EmitterMessageCallback value) {
+    this._setValue(this._createKey(channel), 0, value);    
+  }
+
+  unRegisterHandler(String channel) {
+    this._tryRemove(this._createKey(channel), 0);       
+  }
+
+  List<EmitterMessageCallback> match(String channel)  {
+    var query = this._createKey(channel);
+    var result =  this._recurMatch(query, 0, this.children);
+    return result;
+  }
+
+  _setValue(List<String> key, int position, EmitterMessageCallback value) {
+    if (position == key.length)
+    {
+      this.value = value;
+      return this.value;
+    }
+
+    ReverseTrie child;
+    if (this.children[key[position]] != null) {
+      child = this.children[key[position]];
+    } else {
+      child = new ReverseTrie(level: position);
+      this.children[key[position]] = child;
+    }           
+    return child._setValue(key, position + 1, value);
+  }
+
+  List<String> _createKey(String channel) {
+    return channel.replaceAll(new RegExp("^[/]+"), "").replaceAll(new RegExp("[/]+\$"), "").split("/");
+  }
+
+  bool _tryRemove(List<String> key, int position) {
+    if (position == key.length)
+    {
+      if (this.value == null)
+          return false;
+      this.value = null;
+      return true;
+    }
+
+    // Remove from the child
+    ReverseTrie child = this.children[key[position]];
+    if (child != null)
+      return child._tryRemove(key, position + 1);
+
+    this.value = null;
+    return false;
+  }
+
+  List<EmitterMessageCallback> _recurMatch(List<String> query, int posInQuery, Map<String, ReverseTrie> children) {
+    List<EmitterMessageCallback> matches = [];
+    if (posInQuery == query.length)
+      return matches;
+    ReverseTrie childNode = children["+"];
+    if (childNode != null) {
+      if (childNode.value != null)
+        matches.add(childNode.value);
+      matches.addAll(this._recurMatch(query, posInQuery + 1, childNode.children));
+    }
+    childNode = children[query[posInQuery]];
+    if (childNode != null) {
+      if (childNode.value != null)
+        matches.add(childNode.value);
+      matches.addAll(this._recurMatch(query, posInQuery + 1, childNode.children));
+    }
+    return matches;
+  }
+
 }
